@@ -1,0 +1,438 @@
+import tensorflow as tf
+import sentencepiece as spm
+from prepro_utils import preprocess_text, encode_ids, encode_pieces, printable_text
+import function_builder
+import model_utils
+import squad_utils
+from data_utils import SEP_ID, CLS_ID, VOCAB_SIZE
+import xlnet
+import sys
+import numpy as np
+
+from absl import flags
+import absl.logging as _logging  # pylint: disable=unused-import
+
+# Preprocessing
+flags.DEFINE_bool("do_prepro", default=False,
+      help="Perform preprocessing only.")
+flags.DEFINE_integer("num_proc", default=1,
+      help="Number of preprocessing processes.")
+flags.DEFINE_integer("proc_id", default=0,
+      help="Process id for preprocessing.")
+# Model
+flags.DEFINE_string("model_config_path", default='./base_tf_model/xlnet_cased_L-12_H-768_A-12/xlnet_config.json',
+      help="Model config path.")
+flags.DEFINE_float("dropout", default=0.1,
+      help="Dropout rate.")
+flags.DEFINE_float("dropatt", default=0.1,
+      help="Attention dropout rate.")
+flags.DEFINE_integer("clamp_len", default=-1,
+      help="Clamp length.")
+flags.DEFINE_string("summary_type", default="last",
+      help="Method used to summarize a sequence into a vector.")
+flags.DEFINE_bool("use_bfloat16", default=False,
+      help="Whether to use bfloat16.")
+
+# Parameter initialization
+flags.DEFINE_enum("init", default="normal",
+                  enum_values=["normal", "uniform"],
+                  help="Initialization method.")
+flags.DEFINE_float("init_std", default=0.02,
+                   help="Initialization std when init is normal.")
+flags.DEFINE_float("init_range", default=0.1,
+                   help="Initialization std when init is uniform.")
+
+# I/O paths
+flags.DEFINE_bool("overwrite_data", default=False,
+                  help="If False, will use cached data if available.")
+flags.DEFINE_string("init_checkpoint", default='./base_tf_model/xlnet_cased_L-12_H-768_A-12/xlnet_model.ckpt',
+                    help="checkpoint path for initializing the model. "
+                    "Could be a pretrained model or a finetuned model.")
+flags.DEFINE_bool("init_global_vars", default=False,
+                  help="If true, init all global vars. If false, init "
+                  "trainable vars only.")
+flags.DEFINE_string("output_dir", default="./proc_data/squad/",
+                    help="Output dir for TF records.")
+flags.DEFINE_string("predict_dir", default="",
+                    help="Dir for predictions.")
+flags.DEFINE_string("spiece_model_file", default="./base_tf_model/xlnet_cased_L-12_H-768_A-12/spiece.model",
+                    help="Sentence Piece model path.")
+flags.DEFINE_string("model_dir", default="./experiment/squad/",
+                    help="Directory for saving the finetuned model.")
+flags.DEFINE_string("train_file", default="./data/squad/train-v2.0.json",
+                    help="Path of train file.")
+flags.DEFINE_string("predict_file", default="./data/squad/dev-v2.0.json",
+                    help="Path of prediction file.")
+
+# Data preprocessing config
+flags.DEFINE_integer("max_seq_length",
+                     default=512, help="Max sequence length")
+flags.DEFINE_integer("max_query_length",
+                     default=64, help="Max query length")
+flags.DEFINE_integer("doc_stride",
+                     default=128, help="Doc stride")
+flags.DEFINE_integer("max_answer_length",
+                     default=64, help="Max answer length")
+flags.DEFINE_bool("uncased", default=False, help="Use uncased data.")
+
+
+# TPUs and machines
+flags.DEFINE_bool("use_tpu", default=False, help="whether to use TPU.")
+flags.DEFINE_integer("num_hosts", default=1, help="How many TPU hosts.")
+flags.DEFINE_integer("num_core_per_host", default=8,
+      help="8 for TPU v2 and v3-8, 16 for larger TPU v3 pod. In the context "
+      "of GPU training, it refers to the number of GPUs used.")
+flags.DEFINE_string("tpu_job_name", default=None, help="TPU worker job name.")
+flags.DEFINE_string("tpu", default=None, help="TPU name.")
+flags.DEFINE_string("tpu_zone", default=None, help="TPU zone.")
+flags.DEFINE_string("gcp_project", default=None, help="gcp project.")
+flags.DEFINE_string("master", default=None, help="master")
+flags.DEFINE_integer("iterations", default=1000,
+                     help="number of iterations per TPU training loop.")
+
+# Training
+flags.DEFINE_bool("do_train", default=True, help="whether to do training")
+flags.DEFINE_integer("train_batch_size", default=8,
+                     help="batch size for training")
+flags.DEFINE_integer("train_steps", default=12000,
+                     help="Number of training steps")
+flags.DEFINE_integer("warmup_steps", default=1000, help="number of warmup steps")
+flags.DEFINE_integer("save_steps", default=1000,
+                     help="Save the model for every save_steps. "
+                     "If None, not to save any model.")
+flags.DEFINE_integer("max_save", default=5,
+                     help="Max number of checkpoints to save. "
+                     "Use 0 to save all.")
+flags.DEFINE_integer("shuffle_buffer", default=2048,
+                     help="Buffer size used for shuffle.")
+
+# Optimization
+flags.DEFINE_float("learning_rate", default=3e-5, help="initial learning rate")
+flags.DEFINE_float("min_lr_ratio", default=0.0,
+                   help="min lr ratio for cos decay.")
+flags.DEFINE_float("clip", default=1.0, help="Gradient clipping")
+flags.DEFINE_float("weight_decay", default=0.00, help="Weight decay rate")
+flags.DEFINE_float("adam_epsilon", default=1e-6, help="Adam epsilon")
+flags.DEFINE_string("decay_method", default="poly", help="poly or cos")
+flags.DEFINE_float("lr_layer_decay_rate", default=0.75,
+                   help="Top layer: lr[L] = FLAGS.learning_rate."
+                   "Lower layers: lr[l-1] = lr[l] * lr_layer_decay_rate.")
+
+# Eval / Prediction
+flags.DEFINE_bool("do_predict", default=False, help="whether to do predict")
+flags.DEFINE_integer("predict_batch_size", default=32,
+                     help="batch size for prediction")
+flags.DEFINE_integer("n_best_size", default=5,
+                     help="n best size for predictions")
+flags.DEFINE_integer("start_n_top", default=5, help="Beam size for span start.")
+flags.DEFINE_integer("end_n_top", default=5, help="Beam size for span end.")
+flags.DEFINE_string("target_eval_key", default="best_f1",
+                    help="Use has_ans_f1 for Model I.")
+
+FLAGS = flags.FLAGS
+FLAGS(['__mian__'])
+
+xlnet_config = xlnet.XLNetConfig(json_path=FLAGS.model_config_path)
+run_config = xlnet.create_run_config(True, True, FLAGS)
+
+
+# inp = tf.transpose(features["input_ids"], [1, 0])
+# seg_id = tf.transpose(features["segment_ids"], [1, 0])
+# inp_mask = tf.transpose(features["input_mask"], [1, 0])
+# cls_index = tf.reshape(features["cls_index"], [-1])
+# seq_len = tf.shape(inp)[0]
+
+
+inp = tf.placeholder(dtype=tf.int32,shape=(None,FLAGS.max_seq_length))
+seg_id = tf.placeholder(dtype=tf.int32,shape=(None,FLAGS.max_seq_length))
+inp_mask = tf.placeholder(dtype=tf.float32,shape=(None,FLAGS.max_seq_length))
+#cls_index = tf.placeholder(dtype=tf.int32,shape=(None))
+cls_index_inp = tf.placeholder(dtype=tf.int32,shape=(None,1))
+is_impossible_inp = tf.placeholder(dtype=tf.float32,shape=(None))
+
+inp_transpose = tf.transpose(inp, [1, 0])
+seg_id_transpose = tf.transpose(seg_id, [1, 0])
+inp_mask_transpose = tf.transpose(inp_mask, [1, 0])
+
+xlnet_model = xlnet.XLNetModel(
+  xlnet_config=xlnet_config,
+  run_config=run_config,
+  input_ids=inp_transpose,
+  seg_ids=seg_id_transpose,
+  input_mask=inp_mask_transpose)
+output = xlnet_model.get_sequence_output()
+p_mask = tf.placeholder(dtype=tf.float32,shape=(None,FLAGS.max_seq_length))
+keep_prob = tf.placeholder_with_default(1.0,shape=(None)) #if train 0.8
+
+is_training =True
+start_position_label = tf.placeholder(dtype=tf.int32,shape=(None))
+end_position_label = tf.placeholder(dtype=tf.int32,shape=(None))
+seq_len = FLAGS.max_seq_length
+
+with tf.variable_scope("start_logits"):
+    start_logits = tf.layers.dense(
+        output,
+        512,
+        kernel_initializer=initializer,
+        name="start_dense_1")
+    start_logits = tf.nn.relu(start_logits)
+    start_logits = tf.nn.dropout(start_logits, keep_prob)
+    start_logits = tf.layers.dense(
+        start_logits,
+        384,
+        kernel_initializer=initializer,
+        name="start_dense_2")
+    start_logits = tf.nn.relu(start_logits)
+    start_logits = tf.nn.dropout(start_logits, keep_prob)
+    
+    start_logits = tf.layers.dense(
+        start_logits,
+        1,
+        kernel_initializer=initializer,
+        name="start_dense_3")
+    
+    start_logits = tf.transpose(tf.squeeze(start_logits, -1), [1, 0])
+    start_logits_masked = start_logits * (1 - p_mask) - 1e30 * p_mask
+    start_log_probs = tf.nn.log_softmax(start_logits_masked, -1)
+# logit of the end position
+with tf.variable_scope("end_logits"):
+    if is_training:
+      # during training, compute the end logits based on the
+      # ground truth of the start position
+
+        start_positions = tf.reshape(start_position_label, [-1])
+        start_index = tf.one_hot(start_positions, depth=seq_len, axis=-1,
+                               dtype=tf.float32)
+        start_features = tf.einsum("lbh,bl->bh", output, start_index)
+        start_features = tf.tile(start_features[None], [seq_len, 1, 1])
+      
+        end_logits = tf.layers.dense(
+            tf.concat([output, start_features], axis=-1), xlnet_config.d_model,
+            kernel_initializer=initializer, activation=tf.tanh, name="dense_0")
+        end_logits = tf.contrib.layers.layer_norm(end_logits, begin_norm_axis=-1)
+        print(end_logits)
+        end_logits = tf.layers.dense(
+            end_logits, 512,
+            kernel_initializer=initializer,
+            name="end_dense_1")
+        end_logits = tf.nn.relu(end_logits)  
+        end_logits = tf.nn.dropout(end_logits, keep_prob)
+
+        end_logits = tf.layers.dense(
+            end_logits, 384,
+            kernel_initializer=initializer,
+            name="end_dense_2")
+        end_logits = tf.nn.relu(end_logits)  
+        end_logits = tf.nn.dropout(end_logits, keep_prob)
+  
+        end_logits = tf.layers.dense(
+            end_logits, 1,
+            kernel_initializer=initializer,
+            name="end_dense_3")
+  
+  
+        end_logits = tf.transpose(tf.squeeze(end_logits, -1), [1, 0])
+        end_logits_masked = end_logits * (1 - p_mask) - 1e30 * p_mask
+        end_log_probs = tf.nn.log_softmax(end_logits_masked, -1)
+    else:
+      # during inference, compute the end logits based on beam search
+
+        start_top_log_probs, start_top_index = tf.nn.top_k(
+          start_log_probs, k=FLAGS.start_n_top)
+        start_index = tf.one_hot(start_top_index,
+                                 depth=seq_len, axis=-1, dtype=tf.float32)
+        start_features = tf.einsum("lbh,bkl->bkh", output, start_index)
+        end_input = tf.tile(output[:, :, None],
+                            [1, 1, FLAGS.start_n_top, 1])
+        start_features = tf.tile(start_features[None],
+                                 [seq_len, 1, 1, 1])
+       
+       
+        end_input = tf.concat([end_input, start_features], axis=-1)
+        end_logits = tf.layers.dense(
+            end_input,
+            xlnet_config.d_model,
+            kernel_initializer=initializer,
+            activation=tf.tanh,
+            name="dense_0")
+        end_logits = tf.contrib.layers.layer_norm(end_logits, begin_norm_axis=-1)
+        
+        end_logits = tf.layers.dense(
+            end_logits, 512,
+            kernel_initializer=initializer,
+            name="end_dense_1")
+        end_logits = tf.nn.relu(end_logits)  
+        end_logits = tf.nn.dropout(end_logits, 1.0)
+  
+        end_logits = tf.layers.dense(
+            end_logits, 384,
+            kernel_initializer=initializer,
+            name="end_dense_2")
+        end_logits = tf.nn.relu(end_logits)  
+        end_logits = tf.nn.dropout(end_logits, 1.0)
+  
+        end_logits = tf.layers.dense(
+            end_logits,
+            1,
+            kernel_initializer=initializer,
+            name="end_dense_3")
+  
+        end_logits = tf.reshape(end_logits, [seq_len, -1, FLAGS.start_n_top])
+        end_logits = tf.transpose(end_logits, [1, 2, 0])
+        end_logits_masked = end_logits * (
+            1 - p_mask[:, None]) - 1e30 * p_mask[:, None]
+        end_log_probs = tf.nn.log_softmax(end_logits_masked, -1)
+        end_top_log_probs, end_top_index = tf.nn.top_k(
+            end_log_probs, k=FLAGS.end_n_top)
+        end_top_log_probs = tf.reshape(
+            end_top_log_probs,
+            [-1, FLAGS.start_n_top * FLAGS.end_n_top])
+        end_top_index = tf.reshape(
+            end_top_index,
+            [-1, FLAGS.start_n_top * FLAGS.end_n_top])
+
+# an additional layer to predict answerability
+with tf.variable_scope("answer_class"):
+    # get the representation of CLS
+    #cls_index = tf.one_hot(cls_index, seq_len, axis=-1, dtype=tf.float32)
+
+    cls_index = tf.squeeze(tf.one_hot(cls_index_inp, seq_len, axis=-1, dtype=tf.float32),axis=1)
+    cls_feature = tf.einsum("lbh,bl->bh", output, cls_index)
+
+    # get the representation of START
+    start_p = tf.nn.softmax(start_logits_masked, axis=-1,
+                            name="softmax_start")
+    start_feature = tf.einsum("lbh,bl->bh", output, start_p)
+
+    # note(zhiliny): no dependency on end_feature so that we can obtain
+    # one single `cls_logits` for each sample
+    ans_feature = tf.concat([start_feature, cls_feature], -1)
+    ans_feature = tf.layers.dense(
+        ans_feature,
+        xlnet_config.d_model,
+        activation=tf.tanh,
+        kernel_initializer=initializer, name="dense_0")
+    ans_feature = tf.layers.dropout(ans_feature, FLAGS.dropout,
+                                    training=is_training)
+    
+    cls_logits = tf.layers.dense(
+        ans_feature, 256,
+        kernel_initializer=initializer,
+        name="cls_dense_256")
+    cls_logits = tf.nn.relu(cls_logits)  
+    cls_logits = tf.nn.dropout(cls_logits, keep_prob)
+    
+    cls_logits = tf.layers.dense(
+        cls_logits,
+        1,
+        kernel_initializer=initializer,
+        name="dense_1",
+        use_bias=False)
+    cls_logits = tf.squeeze(cls_logits, -1)
+
+
+
+def read_squad_tf(input_glob):
+    def parse_single_example(x):
+        seq_length = FLAGS.max_seq_length
+        name_to_features = {
+        "unique_ids": tf.FixedLenFeature([], tf.int64),
+        "input_ids": tf.FixedLenFeature([seq_length], tf.int64),
+        "input_mask": tf.FixedLenFeature([seq_length], tf.float32),
+        "segment_ids": tf.FixedLenFeature([seq_length], tf.int64),
+        "cls_index": tf.FixedLenFeature([], tf.int64),
+        "p_mask": tf.FixedLenFeature([seq_length], tf.float32)
+        }     
+        if is_training:
+            name_to_features["start_positions"] = tf.FixedLenFeature([], tf.int64)
+            name_to_features["end_positions"] = tf.FixedLenFeature([], tf.int64)
+            name_to_features["is_impossible"] = tf.FixedLenFeature([], tf.float32)   
+        one_single_example = tf.parse_single_example(x,name_to_features)
+        return one_single_example
+    files = tf.gfile.Glob(input_glob)
+    tf_data = tf.data.TFRecordDataset(files,num_parallel_reads=len(files))
+    tf_data = tf_data.map(parse_single_example)
+    return tf_data
+df = read_squad_tf('./proc_data/squad/*')
+itera = df.batch(2).make_one_shot_iterator().get_next()
+import collections
+import re
+def get_assignment_map_from_checkpoint(tvars, init_checkpoint):
+    """Compute the union of the current variables and checkpoint variables.
+        to get match variables to load values
+    """
+    initialized_variable_names = {}
+    name_to_variable = collections.OrderedDict()
+    for var in tvars:
+        name = var.name
+        m = re.match("^(.*):\\d+$", name)
+        if m is not None:
+            name = m.group(1)
+        name_to_variable[name] = var
+        #print(name)
+
+    init_vars = tf.train.list_variables(init_checkpoint)
+    #print(f"init_vars : {init_vars} from ckpt: {init_checkpoint}")
+    assignment_map = collections.OrderedDict()
+    for x in init_vars:
+        (name, var) = (x[0], x[1])
+        if name not in name_to_variable :
+            print(name)
+            continue
+        assignment_map[name] = name_to_variable[name]
+        initialized_variable_names[name] = 1
+        initialized_variable_names[name + ":0"] = 1
+
+    return assignment_map, initialized_variable_names
+assignment_map, initialized_variable_names = get_assignment_map_from_checkpoint(tf.trainable_variables(),\
+                                                                                './base_tf_model/xlnet_cased_L-12_H-768_A-12/xlnet_model.ckpt')
+
+sess = tf.Session()
+tf.train.init_from_checkpoint('./base_tf_model/xlnet_cased_L-12_H-768_A-12/xlnet_model.ckpt',assignment_map)
+### Compute loss
+seq_length = FLAGS.max_seq_length
+
+def compute_loss(log_probs, positions):
+    one_hot_positions = tf.one_hot(
+      positions, depth=seq_length, dtype=tf.float32)
+
+    loss = - tf.reduce_sum(one_hot_positions * log_probs, axis=-1)
+    loss = tf.reduce_mean(loss)
+    return loss
+
+start_loss = compute_loss(
+    start_log_probs, start_position_label)
+end_loss = compute_loss(
+    end_log_probs,end_position_label)
+
+total_loss = (start_loss + end_loss) * 0.5
+
+regression_loss = tf.nn.sigmoid_cross_entropy_with_logits(
+    labels=is_impossible_inp, logits=cls_logits)
+regression_loss = tf.reduce_mean(regression_loss)
+
+# note(zhiliny): by default multiply the loss by 0.5 so that the scale is
+# comparable to start_loss and end_loss
+total_loss += regression_loss * 0.5
+
+optimizer = tf.train.AdamOptimizer(learning_rate=FLAGS.learning_rate,epsilon=FLAGS.adam_epsilon)
+global_step = tf.train.get_or_create_global_step()
+train_op = optimizer.minimize(total_loss,global_step=global_step)
+
+sess.run(tf.global_variables_initializer())
+i = 0
+while i<5:
+    i += 1
+    try:
+        text_example = sess.run(itera)
+    except:
+        print('data load end')
+        break
+    #np.expand_dims(text_example['end_positions'],axis=1).shape
+    _,ploss = sess.run([train_op,total_loss],feed_dict ={inp:text_example['input_ids'],seg_id:text_example['segment_ids'],inp_mask:text_example['input_mask'],
+                                     cls_index_inp:np.expand_dims(text_example['cls_index'],axis=1),p_mask:text_example['p_mask'],start_position_label:text_example['start_positions'],
+                                     end_position_label:text_example['end_positions'],is_impossible_inp:text_example['is_impossible']})
+    
+    print('step : ',i,'  ',ploss)
+    
+
